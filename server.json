@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/amf-filings",
   "title": "Amf Filings",
   "description": "France AMF Regulated Filings MCP — keyless, same-day-fresh.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/amf-filings",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-amf-filings",
