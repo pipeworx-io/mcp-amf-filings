@@ -5,13 +5,15 @@ seuils, information privilégiée, rachats d'actions, etc.) from Info-financièr
 the French Officially Appointed Mechanism (OAM) — updated as the AMF publishes,
 not months behind like the community ESEF index.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1843+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1854+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `amf_search_filings(company?, isin?, lei?, date_from?, date_to?, language?, limit?, offset?)`
   — search disclosures by issuer (ISIN preferred, LEI often null, or free-text
-  name) and/or a publication date window. Returns the newest first.
+  name) and/or a publication date window. `date_to` is INCLUSIVE (the last
+  day you want included) — set `date_from` and `date_to` to the SAME date
+  for a single-day check. Returns the newest first.
 - `amf_get_filing(id)` — fetch one disclosure by its Info-financière record id
   (`uin_idt_uin`), as returned by `amf_search_filings`.
 
@@ -31,7 +33,17 @@ freshness, 2026-09-23**: the newest record in the dataset was timestamped
 call against the deployed gateway (see `workers/gateway/src/tool-examples.json`
 for the exact arguments used).
 
-## ⚠️ Three things a caller must know
+## One call per day, not one call per issuer
+
+`company`, `isin`, and `lei` are all optional. Omit them entirely and pass
+only `date_from`/`date_to` to get every issuer's filings for that window in
+ONE call (paginate with `limit`/`offset` only if a single day's market-wide
+volume exceeds the 100-row cap) — verified live 2026-10-19. A design partner
+doing a daily check across ~155 issuers was instead calling once per issuer
+and exhausting a 50-credit-per-call allowance in ~35 calls (fleet #3300); the
+date-window call is the cheap way to do that check.
+
+## ⚠️ Six things a caller must know
 
 1. **This is a document index, not an XBRL-facts API.** Every row is a
    disclosure EVENT: a title, an issuer, a publication timestamp, and a link
@@ -49,10 +61,37 @@ for the exact arguments used).
    subsidiaries of French groups (e.g. Gabon-domiciled TotalEnergies EP
    Gabon). `country` reflects the issuer's own registered country in the
    AMF's record, not "France" by default.
+4. **`company` matches the LEGAL name, not the trade name — with an
+   automatic fallback.** The AMF stores issuers under their registered legal
+   name (e.g. "TELEVISION FRANCAISE 1"), and `search()` is token-based, not
+   substring, so a trade-name query like `company: "TF1"` matches zero rows
+   there even though 38 genuinely exist in the same window (verified live
+   2026-10-19, fleet #3300). `amf_search_filings` now retries against the
+   disclosure TITLE when the legal-name search comes back empty, and the
+   response carries `matched_via: "title"` plus `company_resolved` (the real
+   legal name) when that is what found it — pass `isin` when you have it to
+   skip the fallback entirely.
+5. **`subtype_of_information` is normalised to a real `null`.** Some
+   disseminators (307 in particular, 9,519 rows at last check) send the
+   literal STRING `"NULL"` rather than an actual null. This pack converts any
+   case-insensitive `"null"` string to a real null before returning it.
+6. **`date_to` is INCLUSIVE of that whole UTC day.** A one-day check sets
+   `date_from` and `date_to` to the SAME date; this pack handles the
+   upstream's own exclusive bound internally (querying one calendar day
+   past it) and echoes the actual bound sent as `upstream_date_to_exclusive`.
+   This used to not be true: a same-day window
+   (`date_from=date_to="2026-10-16"`) silently returned zero rows where 61
+   existed, because the upstream bound was passed straight through as an
+   exclusive one — fixed 2026-10-20 (a paying customer running one-day ESEF
+   checks across every issuer hit it directly). A `date_from` after
+   `date_to` now returns `empty_reason: "empty_window"` with an explanatory
+   `message` instead of a bare zero.
 
-Bilingual issuers often file the same disclosure in French and English as two
-separate rows (each with its own `id`) a few minutes apart — `amf_search_filings`
-does not merge these; use `language` to pick one edition if you only want one.
+Bilingual issuers file the same disclosure in French and English as two
+separate rows (each with its own `id`) within the same minute —
+`amf_search_filings` does not merge these; pass `language` to pick one
+edition, or group results client-side on the returned `language_pair_key`
+(company + type/subtype + publication minute).
 
 ## Auth
 
@@ -72,7 +111,9 @@ Keyless. No account, no API key.
   directly to save the round trip.
 - `limit` is capped at 100 by the upstream API (`-1 <= limit <= 100`); a
   higher value 400s rather than silently clamping. This pack clamps to 100
-  before the request goes out.
+  before the request goes out and reports the original value as
+  `limit_clamped_from` in the response when it does, so the clamp is never
+  silent.
 - ODSQL `where` clauses on `uin_dat_amf` (the filing timestamp) genuinely
   bind — verified live with a same-day-exclusion test — unlike the sibling
   `esef-filings` date-filter bug this pack was written to not repeat.
@@ -125,7 +166,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1843+ data sources. The
+Both URLs reach the same gateway and the same 1854+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

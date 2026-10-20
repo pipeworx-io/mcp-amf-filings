@@ -952,6 +952,35 @@ async function parseJsonBounded<T>(
  * e.g. Gabonese/African subsidiaries of French groups) — `country` reflects
  * the issuer's registered country from the AMF's own record, not "France".
  *
+ * ⚠️ TRADE NAME ≠ LEGAL NAME, AND THIS DATASET STORES THE LEGAL NAME. The
+ * AMF's own `company` field is the issuer's registered legal name (e.g.
+ * "TELEVISION FRANCAISE 1", not "TF1"), and ODSQL's `search()` is token-based,
+ * not substring — "TF1" matches zero rows by company name even though 38
+ * genuinely exist (verified live 2026-10-19: isin=FR0000054900 from
+ * 2026-01-01 returns 38 rows with company="TELEVISION FRANCAISE 1"; the same
+ * window filtered by company="TF1" returns 0). This tool therefore falls back
+ * to searching the disclosure TITLE (which commonly carries the trade name,
+ * e.g. "TF1 - Q1 2026 Results") whenever a company-name search returns zero
+ * rows, and reports `matched_via: "title"` plus the resolved legal name on
+ * every row so the caller can retry directly by isin/company_resolved next
+ * time. Prefer isin when known — it is exact and avoids the fallback.
+ *
+ * ⚠️ BILINGUAL FILINGS ARE DUPLICATE ROWS, NOT ONE FILING WITH TWO FIELDS.
+ * An issuer that files in both languages publishes TWO separate records with
+ * different ids in the same minute (verified live: TF1's September 2026
+ * voting-rights disclosure is id 083320_20261001 (en) and 083319_20261001
+ * (fr), both published within 21 seconds of each other). Pass `language` to
+ * get one edition only; otherwise expect pairs. Each shaped filing carries a
+ * `language_pair_key` (company + type/subtype + the publication minute) so a
+ * caller that wants one-row-per-event can group on it client-side.
+ *
+ * ⚠️ `subtype_of_information` ARRIVES AS THE LITERAL STRING "NULL" ON SOME
+ * ROWS, NOT A REAL NULL. Disseminator 307 in particular (9,519 rows at last
+ * check, mostly "Franchissements de seuils" threshold crossings) sends the
+ * string "NULL" where other disseminators send an actual null or a real
+ * value. This tool normalises any case-insensitive "null" string to a real
+ * null before returning it, so callers never have to string-match "NULL".
+ *
  * All tools return shaped, LLM-friendly objects (not raw API passthrough) and
  * never throw — fetch/parse failures resolve to { error }.
  */
@@ -974,17 +1003,17 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'amf_search_filings',
     description:
-      'Search French AMF-regulated company disclosures (résultats, franchissements de seuils, information privilégiée, rachats d\'actions, and similar) from Info-financière, the French Officially Appointed Mechanism. PREFER OVER esef_filing_search FOR FRENCH ISSUERS — this source is updated same-day, unlike the community ESEF index which runs months behind for French/EU filings. Identify the issuer with isin (most reliable), lei (frequently null — do not rely on it alone), or a free-text company name; narrow by date_from/date_to (ISO date, UTC). Returns disclosure EVENTS — title, issuer, timestamp, and a PDF/document link — NOT extracted XBRL facts.',
+      'Search French AMF-regulated company disclosures (résultats, franchissements de seuils, information privilégiée, rachats d\'actions, and similar) from Info-financière, the French Officially Appointed Mechanism. PREFER OVER esef_filing_search FOR FRENCH ISSUERS — this source is updated same-day, unlike the community ESEF index which runs months behind for French/EU filings. Identify the issuer with isin (most reliable), lei (frequently null — do not rely on it alone), or a free-text company name; narrow by date_from/date_to (ISO date, UTC) — date_to IS INCLUSIVE of that whole UTC day, so a single-day check sets date_from and date_to to the SAME date (e.g. both "2026-10-16" to get everything published that day); a date_from after date_to returns empty_reason:"empty_window" rather than a bare zero. ALL THREE ARE OPTIONAL — omit company/isin/lei entirely to get every issuer\'s filings in the date window in ONE call (paginate with limit/offset only if a single day\'s market-wide volume exceeds the 100-row limit); this is far cheaper than calling once per issuer for a multi-issuer daily check. company is matched against the AMF\'s own LEGAL-NAME field (e.g. "TELEVISION FRANCAISE 1", not "TF1") — a trade-name search that matches zero legal-name rows automatically retries against disclosure titles and the response says matched_via:"title" when that is what found it, so prefer isin when you have it. Bilingual issuers publish each release TWICE (fr + en, separate ids, same minute) — pass language to get one edition, or group results by the returned language_pair_key. subtype_of_information is normalised to a real null (some disseminators send the literal string "NULL"). Returns disclosure EVENTS — title, issuer, timestamp, and a PDF/document link — NOT extracted XBRL facts.',
     inputSchema: {
       type: 'object',
       properties: {
-        company: { type: 'string', description: 'Free-text issuer name search, e.g. "TotalEnergies", "LVMH". Matches on the AMF\'s own company-name field; a distinct legal entity (e.g. a listed subsidiary) with a similar name may also match.' },
+        company: { type: 'string', description: 'Free-text issuer name search, e.g. "TotalEnergies", "LVMH". Matches on the AMF\'s own LEGAL-NAME company field first; a distinct legal entity (e.g. a listed subsidiary) with a similar name may also match. If the legal name differs from the trade name you typed (e.g. "TF1" vs. legal name "TELEVISION FRANCAISE 1") and the legal-name match is empty, this tool automatically retries against disclosure titles — check matched_via and company_resolved in the response.' },
         isin: { type: 'string', description: 'Issuer ISIN, e.g. "FR0013230950". The most reliable identifier in this dataset — prefer this over lei or company name when known.' },
         lei: { type: 'string', description: 'Issuer LEI (Legal Entity Identifier), e.g. "9695002GVC14VHLFIH85". Populated on many but not all rows — a miss does not mean the issuer has no filings; retry with isin or company.' },
         date_from: { type: 'string', description: 'Only filings published on or after this date (YYYY-MM-DD, UTC). Filters on the actual AMF publication timestamp.' },
-        date_to: { type: 'string', description: 'Only filings published before this date (YYYY-MM-DD, UTC, exclusive).' },
+        date_to: { type: 'string', description: 'Only filings published on or before this date (YYYY-MM-DD, UTC, INCLUSIVE — the last day you want included). For a single-day check pass the same date as date_from. The upstream API\'s own bound is exclusive of that day; this tool handles that internally by querying one calendar day past it, so you never need to add a day yourself.' },
         language: { type: 'string', description: 'Filter to one language edition when an issuer files bilingual pairs: "fr" or "en". Omit to get both (each language edition is a separate row with its own id).' },
-        limit: { type: ['number', 'string'], description: 'Number of filings to return (1-100). Default 10.' },
+        limit: { type: ['number', 'string'], description: 'Number of filings to return (1-100, clamped if you pass more — the response reports limit_clamped_from when it does). Default 10.' },
         offset: { type: ['number', 'string'], description: 'Result offset for pagination. Default 0.' },
       },
     },
@@ -1023,20 +1052,37 @@ function odsqlStr(v: string): string {
   return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
+// Several disseminators (307 in particular, 9,519 rows at last check) send
+// the literal string "NULL" instead of a real null — normalise both the
+// exact-case and any other-case spelling so callers never have to
+// string-match it themselves.
+function normalizeNull(v: unknown): unknown {
+  if (typeof v === 'string' && v.trim().toUpperCase() === 'NULL') return null;
+  return v ?? null;
+}
+
 function shapeFiling(r: Record<string, any>): Record<string, unknown> {
+  const type_of_information = normalizeNull(r.type_of_information_nouveau ?? r.type_of_information);
+  const subtype_of_information = normalizeNull(r.subtype_of_information);
+  const publishedAt: string | undefined = r.uin_dat_amf;
+  // Bilingual pairs land within the same minute under different ids — this
+  // key groups them without relying on any shared id between the two rows
+  // (there isn't one): same company, same type/subtype, same publish minute.
+  const minuteKey = typeof publishedAt === 'string' ? publishedAt.slice(0, 16) : publishedAt;
   return {
     id: r.uin_idt_uin,
-    published_at: r.uin_dat_amf,
+    published_at: publishedAt,
     company: r.identificationsociete_iso_nom_soc,
     isin: r.identificationsociete_iso_cd_isi ?? null,
     lei: r.identificationsociete_iso_cd_lei ?? null,
     country: r.identificationsociete_iso_pay_ss ?? null,
     title: r.informationdeposee_inf_tit_inf,
     language: r.informationdeposee_inf_lng_inf === 'Anglais' ? 'en' : r.informationdeposee_inf_lng_inf === 'Français' ? 'fr' : (r.informationdeposee_inf_lng_inf ?? null),
-    type_of_information: r.type_of_information_nouveau ?? r.type_of_information ?? null,
-    subtype_of_information: r.subtype_of_information ?? null,
+    type_of_information,
+    subtype_of_information,
     disseminator: r.identificationdiffuseur_idi_cod_dif ?? null,
     document_url: r.url_de_recuperation ?? null,
+    language_pair_key: `${r.identificationsociete_iso_nom_soc ?? ''}|${type_of_information ?? ''}|${subtype_of_information ?? ''}|${minuteKey ?? ''}`,
   };
 }
 
@@ -1058,6 +1104,40 @@ function isoDate(v: string): string {
   return t;
 }
 
+// date_to in THIS tool's contract is INCLUSIVE (the last day to include),
+// but the upstream ODSQL bound (`uin_dat_amf < …`) is a strict less-than —
+// so sending the caller's date_to straight through silently EXCLUDES that
+// whole day. Verified live 2026-10-20: date_from=date_to="2026-10-16" (the
+// one-day check the ESEF-testing customer runs per issuer) returned
+// total_count 0 with the old exclusive behaviour; date_to="2026-10-17" (one
+// day later) returned 61. The sibling eMarket/1INFO packs hit the identical
+// shape of bug and fixed it the same way — see emarket-storage/src/index.ts.
+// Only a bare YYYY-MM-DD date gets the day added; a caller-supplied
+// timestamp with its own time component is passed through unchanged, since
+// the inclusive/exclusive distinction only applies to the documented
+// whole-day shape.
+function addOneDay(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + 1);
+  return dt.toISOString().slice(0, 10);
+}
+
+function upstreamExclusiveDateTo(dateTo: string): string {
+  const t = dateTo.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+  return addOneDay(t);
+}
+
+// Calendar-day-only epoch ms, ignoring any time component — used only to
+// detect a backwards window (date_from after date_to), never to bind the
+// upstream query.
+function dateOnlyMs(v: string): number | undefined {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(v.trim());
+  if (!m) return undefined;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
 async function searchFilings(args: Record<string, unknown>): Promise<unknown> {
   const company = strArg(args.company);
   const isin = strArg(args.isin);
@@ -1066,40 +1146,102 @@ async function searchFilings(args: Record<string, unknown>): Promise<unknown> {
   const dateTo = strArg(args.date_to);
   const language = strArg(args.language);
   const limit = clampInt(args.limit, 10, 1, 100);
+  // limit above 100 (or below 1) is clamped rather than rejected — report it
+  // rather than silently shrinking the caller's request (silent-zero class:
+  // a caller asking for 500 and getting 100 back with no signal reads as
+  // "that's all there was").
+  const rawLimit = rawNum(args.limit);
+  const limitClampedFrom = rawLimit !== undefined && Math.trunc(rawLimit) !== limit ? Math.trunc(rawLimit) : undefined;
   const offset = clampInt(args.offset, 0, 0, 10000);
 
-  const clauses: string[] = [];
-  if (isin) clauses.push(`identificationsociete_iso_cd_isi = ${odsqlStr(isin.toUpperCase())}`);
-  if (lei) clauses.push(`identificationsociete_iso_cd_lei = ${odsqlStr(lei.toUpperCase())}`);
-  if (company) clauses.push(`search(identificationsociete_iso_nom_soc, ${odsqlStr(company)})`);
+  // A backwards window (date_from after date_to) can never contain filings —
+  // that is a caller mistake, not "the source had nothing that day". Say so
+  // explicitly rather than making an upstream call whose only possible
+  // answer is a zero that would otherwise read as empty_reason:"no_match"
+  // (the silent-zero class, docs/silent-zero-policy.md). A same-day window
+  // (date_from === date_to) is NOT backwards — it is the normal one-day case.
+  if (dateFrom && dateTo) {
+    const fromMs = dateOnlyMs(dateFrom);
+    const toMs = dateOnlyMs(dateTo);
+    if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) {
+      return {
+        total_count: 0,
+        count: 0,
+        limit,
+        offset,
+        date_from: dateFrom,
+        date_to: dateTo,
+        empty_reason: 'empty_window',
+        message: `date_from (${dateFrom}) is after date_to (${dateTo}) — this window is backwards and can never contain filings. Swap the two dates, or set date_to to the same date as date_from for a single-day check.`,
+        filings: [],
+      };
+    }
+  }
+
+  const dateClauses: string[] = [];
   // date_from/date_to BIND — this is the exact bug this pack exists to avoid
   // repeating (the sibling esef-filings date filter silently returned
   // everything). Verified live: a where clause on uin_dat_amf correctly
   // excludes rows outside the range (measured 2026-09-23).
-  if (dateFrom) clauses.push(`uin_dat_amf >= ${odsqlStr(isoDate(dateFrom))}`);
-  if (dateTo) clauses.push(`uin_dat_amf < ${odsqlStr(isoDate(dateTo))}`);
+  if (dateFrom) dateClauses.push(`uin_dat_amf >= ${odsqlStr(isoDate(dateFrom))}`);
+  // date_to is INCLUSIVE in this tool's contract — see addOneDay/
+  // upstreamExclusiveDateTo above for why the bound sent upstream is one
+  // calendar day later than the caller's date_to.
+  const upstreamDateTo = dateTo ? upstreamExclusiveDateTo(dateTo) : undefined;
+  if (upstreamDateTo) dateClauses.push(`uin_dat_amf < ${odsqlStr(isoDate(upstreamDateTo))}`);
   const lang = langClause(language);
-  if (lang) clauses.push(lang);
+  if (lang) dateClauses.push(lang);
 
-  const params = new URLSearchParams({
-    limit: String(limit),
-    offset: String(offset),
-    order_by: 'uin_dat_amf desc',
-  });
-  if (clauses.length) params.set('where', clauses.join(' and '));
+  const idClauses: string[] = [];
+  if (isin) idClauses.push(`identificationsociete_iso_cd_isi = ${odsqlStr(isin.toUpperCase())}`);
+  if (lei) idClauses.push(`identificationsociete_iso_cd_lei = ${odsqlStr(lei.toUpperCase())}`);
 
-  const data = (await amfGet(params)) as { total_count?: number; results?: any[] };
+  async function runSearch(companyClause: string | undefined): Promise<{ total_count?: number; results?: any[] }> {
+    const clauses = [...idClauses, ...(companyClause ? [companyClause] : []), ...dateClauses];
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+      order_by: 'uin_dat_amf desc',
+    });
+    if (clauses.length) params.set('where', clauses.join(' and '));
+    return (await amfGet(params)) as { total_count?: number; results?: any[] };
+  }
+
+  let matchedVia: 'company' | 'title' | undefined;
+  let data = await runSearch(company ? `search(identificationsociete_iso_nom_soc, ${odsqlStr(company)})` : undefined);
+  if (company) matchedVia = 'company';
+
+  // ⚠️ TRADE NAME ≠ LEGAL NAME FALLBACK. "TF1" matches zero rows against the
+  // legal-name field (the AMF stores "TELEVISION FRANCAISE 1") even though
+  // 38 rows exist for that issuer in the same window — verified live
+  // 2026-10-19. ODSQL's search() is token-based, not substring, so there is
+  // no fuzzy match to lean on within that one field; the disclosure TITLE
+  // commonly carries the trade name instead ("TF1 - Q1 2026 Results"), so a
+  // company search that comes back empty retries there before giving up.
+  if (company && (data.total_count ?? 0) === 0 && idClauses.length === 0) {
+    data = await runSearch(`search(informationdeposee_inf_tit_inf, ${odsqlStr(company)})`);
+    matchedVia = 'title';
+  }
+
   const filings = (data.results ?? []).map(shapeFiling);
+  const companyResolved = matchedVia === 'title' ? filings[0]?.company as string | undefined : undefined;
   return {
     total_count: data.total_count ?? filings.length,
     count: filings.length,
     limit,
+    ...(limitClampedFrom !== undefined ? { limit_clamped_from: limitClampedFrom } : {}),
     offset,
     ...(company ? { company } : {}),
     ...(isin ? { isin } : {}),
     ...(lei ? { lei } : {}),
     ...(dateFrom ? { date_from: dateFrom } : {}),
-    ...(dateTo ? { date_to: dateTo } : {}),
+    // date_to echoed here is the caller's INCLUSIVE end date;
+    // upstream_date_to_exclusive is the actual bound sent to Info-financière
+    // (one calendar day later) — shown for anyone debugging against the raw
+    // upstream directly.
+    ...(dateTo ? { date_to: dateTo, upstream_date_to_exclusive: upstreamDateTo } : {}),
+    ...(matchedVia === 'title' ? { matched_via: 'title', company_resolved: companyResolved, note: `"${company}" did not match any issuer's legal name; matched instead via disclosure title text. Pass isin or company="${companyResolved}" next time to search the legal-name field directly.` } : {}),
+    ...((data.total_count ?? 0) === 0 ? { empty_reason: 'no_match' } : {}),
     filings,
   };
 }
@@ -1129,6 +1271,14 @@ function strArg(v: unknown): string | undefined {
     return t ? t : undefined;
   }
   if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return undefined;
+}
+
+// The raw numeric value the caller actually sent, before any clamping —
+// used only to detect and report when clampInt silently changed it.
+function rawNum(v: unknown): number | undefined {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() && Number.isFinite(Number(v))) return Number(v);
   return undefined;
 }
 
