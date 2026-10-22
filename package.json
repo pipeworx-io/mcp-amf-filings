@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-amf-filings",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "France AMF Regulated Filings MCP — keyless, same-day-fresh.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-814ca9c72d66ff017d6627b9a1e1bc447d5997574685adfdbb8b93cc927fa2ee",
-    "sourceCommit": "b0a4b8e2f3f5b3a4c3f9f2c9a73f91b20d32ce11"
+    "sourceHash": "v1-1407f6fe9c709db4e66d21e0b6f8254569458e7e87c01a90d854065c21d2eee2",
+    "sourceCommit": "71f5325b13bb0ea0de2f0f7207885962ec91a484"
   }
 }
